@@ -135,9 +135,11 @@ spec:
                 description: The CUE package to use for the CUE instance. This is
                   useful when applying a CUE schema to plain yaml files.
                 type: string
-              path:
-                description: The path at which the CUE instance will be built from.
-                type: string
+              paths:
+                description: The paths at which the CUE instances will be built from.
+                items:
+                  type: string
+                type: array
               prune:
                 description: Prune enables garbage collection.
                 type: boolean

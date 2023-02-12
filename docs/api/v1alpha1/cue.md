@@ -156,14 +156,14 @@ string
 </tr>
 <tr>
 <td>
-<code>path</code><br>
+<code>paths</code><br>
 <em>
-string
+[]string
 </em>
 </td>
 <td>
 <em>(Optional)</em>
-<p>The path at which the CUE instance will be built from.</p>
+<p>The paths at which the CUE instances will be built from.</p>
 </td>
 </tr>
 <tr>
@@ -464,14 +464,14 @@ string
 </tr>
 <tr>
 <td>
-<code>path</code><br>
+<code>paths</code><br>
 <em>
-string
+[]string
 </em>
 </td>
 <td>
 <em>(Optional)</em>
-<p>The path at which the CUE instance will be built from.</p>
+<p>The paths at which the CUE instances will be built from.</p>
 </td>
 </tr>
 <tr>

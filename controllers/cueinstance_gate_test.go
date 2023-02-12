@@ -25,7 +25,7 @@ func TestCueInstanceReconciler_Gates(t *testing.T) {
 	err = createKubeConfigSecret(id)
 	g.Expect(err).NotTo(HaveOccurred(), "failed to create kubeconfig secret")
 
-	deployNamespace := "cue-build"
+	deployNamespace := "cue-gate"
 	err = createNamespace(deployNamespace)
 	g.Expect(err).NotTo(HaveOccurred())
 

@@ -54,7 +54,7 @@ func TestCueInstanceReconciler_MultiEnv(t *testing.T) {
 		Spec: cuev1alpha1.CueInstanceSpec{
 			Interval: metav1.Duration{Duration: reconciliationInterval},
 			Root:     "./testdata/multi-env",
-			Path:     "./infra/dev",
+			Paths:    []string{"./infra/dev"},
 			Exprs: []string{
 				"out",
 			},

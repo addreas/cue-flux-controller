@@ -60,9 +60,9 @@ type CueInstanceSpec struct {
 	// +optional
 	Root string `json:"root,omitempty"`
 
-	// The path at which the CUE instance will be built from.
+	// The paths at which the CUE instances will be built from.
 	// +optional
-	Path string `json:"path,omitempty"`
+	Paths []string `json:"paths,omitempty"`
 
 	// The CUE package to use for the CUE instance. This is useful when applying
 	// a CUE schema to plain yaml files.

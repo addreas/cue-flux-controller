@@ -34,6 +34,7 @@ import (
 	"cuelang.org/go/cue/ast"
 	"cuelang.org/go/cue/cuecontext"
 	"cuelang.org/go/cue/load"
+	"cuelang.org/go/cue/parser"
 	"cuelang.org/go/encoding/yaml"
 	securejoin "github.com/cyphar/filepath-securejoin"
 	"github.com/fluxcd/pkg/apis/meta"
@@ -279,6 +280,7 @@ func (r *CueInstanceReconciler) reconcile(
 	ctx context.Context,
 	cueInstance cuev1alpha1.CueInstance,
 	source sourcev1.Source) (cuev1alpha1.CueInstance, error) {
+
 	// record the value of the reconciliation request, if any
 	if v, ok := meta.ReconcileAnnotationValue(cueInstance.GetAnnotations()); ok {
 		cueInstance.Status.SetLastHandledReconcileRequest(v)
@@ -332,24 +334,25 @@ func (r *CueInstanceReconciler) reconcile(
 	}
 
 	// check build path exists
-	dirPath, err := securejoin.SecureJoin(moduleRootPath, cueInstance.Spec.Path)
-	if err != nil {
-		return cuev1alpha1.CueInstanceNotReady(
-			cueInstance,
-			revision,
-			cuev1alpha1.ArtifactFailedReason,
-			err.Error(),
-		), err
-	}
-
-	if _, err := os.Stat(dirPath); err != nil {
-		err = fmt.Errorf("cueInstance path not found: %w", err)
-		return cuev1alpha1.CueInstanceNotReady(
-			cueInstance,
-			revision,
-			cuev1alpha1.ArtifactFailedReason,
-			err.Error(),
-		), err
+	for _, path := range cueInstance.Spec.Paths {
+		dirPath, err := securejoin.SecureJoin(moduleRootPath, path)
+		if err != nil {
+			return cuev1alpha1.CueInstanceNotReady(
+				cueInstance,
+				revision,
+				cuev1alpha1.ArtifactFailedReason,
+				err.Error(),
+			), err
+		}
+		if _, err := os.Stat(dirPath); err != nil {
+			err = fmt.Errorf("cueInstance path not found: %w", err)
+			return cuev1alpha1.CueInstanceNotReady(
+				cueInstance,
+				revision,
+				cuev1alpha1.ArtifactFailedReason,
+				err.Error(),
+			), err
+		}
 	}
 
 	// setup a Kubernetes client
@@ -365,19 +368,29 @@ func (r *CueInstanceReconciler) reconcile(
 		), fmt.Errorf("failed to build kube client: %w", err)
 	}
 
-	// build the cueInstance
-	resources, err := r.build(ctx, revision, moduleRootPath, dirPath, &cueInstance)
+	values, orphans, err := r.values(ctx, revision, moduleRootPath, &cueInstance)
 	if err != nil {
 		return cuev1alpha1.CueInstanceNotReady(
 			cueInstance,
 			revision,
 			cuev1alpha1.BuildFailedReason,
 			err.Error(),
-		), err
+		), fmt.Errorf("failed to get values: %w", err)
+	}
+
+	// build the cueInstance
+	resources, err := r.build(ctx, revision, values, orphans, &cueInstance)
+	if err != nil {
+		return cuev1alpha1.CueInstanceNotReady(
+			cueInstance,
+			revision,
+			cuev1alpha1.BuildFailedReason,
+			err.Error(),
+		), fmt.Errorf("failed to build: %w", err)
 	}
 
 	// ensure the gates are open
-	gateErrors := r.checkGates(ctx, revision, moduleRootPath, dirPath, &cueInstance)
+	gateErrors := r.checkGates(ctx, revision, values, &cueInstance)
 	if gateErrors != nil {
 		return cuev1alpha1.CueInstanceNotReady(
 			cueInstance,
@@ -498,11 +511,10 @@ func (r *CueInstanceReconciler) reconcile(
 	), err
 }
 
-func (r *CueInstanceReconciler) build(ctx context.Context,
-	revision, root, dir string,
+func (r *CueInstanceReconciler) values(ctx context.Context,
+	revision, root string,
 	instance *cuev1alpha1.CueInstance,
-) ([]byte, error) {
-	log := ctrl.LoggerFrom(ctx)
+) ([]cue.Value, []cue.Value, error) {
 	cctx := cuecontext.New()
 
 	tags := make([]string, 0, len(instance.Spec.Tags))
@@ -524,113 +536,130 @@ func (r *CueInstanceReconciler) build(ctx context.Context,
 	}
 
 	cfg := &load.Config{
-		ModuleRoot: root,
-		Dir:        dir,
-		DataFiles:  true, //TODO: this could be configurable
-		Tags:       tags,
-		TagVars:    tagVars,
+		Dir:       root,
+		DataFiles: true, //TODO: this could be configurable
+		Tags:      tags,
+		TagVars:   tagVars,
 	}
 
 	if instance.Spec.Package != "" {
 		cfg.Package = instance.Spec.Package
 	}
 
-	ix := load.Instances([]string{}, cfg)
-	if len(ix) == 0 {
-		return nil, fmt.Errorf("no instances found")
+	ix := load.Instances(instance.Spec.Paths, cfg)
+
+	for _, inst := range ix {
+		if inst.Err != nil {
+			return nil, nil, inst.Err
+		}
 	}
 
-	inst := ix[0]
-	if inst.Err != nil {
-		return nil, inst.Err
+	values, err := cctx.BuildInstances(ix)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to build instances: %w", err)
 	}
 
-	value := cctx.BuildInstance(inst)
-	if value.Err() != nil {
-		return nil, value.Err()
+	var orphans []cue.Value
+	for _, inst := range ix {
+		for _, of := range inst.OrphanedFiles {
+			if of.Encoding == "yaml" {
+				data, err := yaml.Extract(of.Filename, nil)
+				if err != nil {
+					return nil, nil, err
+				}
+				orphans = append(orphans, cctx.BuildFile(data))
+			}
+		}
 	}
 
+	return values, orphans, nil
+}
+
+func (r *CueInstanceReconciler) build(ctx context.Context,
+	revision string, values []cue.Value, orphans []cue.Value,
+	instance *cuev1alpha1.CueInstance,
+) ([]byte, error) {
+	log := ctrl.LoggerFrom(ctx)
 	shouldValidate := instance.Spec.Validate != nil
 
 	var result bytes.Buffer
-	if len(instance.Spec.Exprs) > 0 {
-		for _, e := range instance.Spec.Exprs {
-			expr := value.LookupPath(cue.ParsePath(e))
+	for _, value := range values {
 
-			data, err := cueEncodeYAML(expr)
+		if len(instance.Spec.Exprs) > 0 {
+			for _, e := range instance.Spec.Exprs {
+				ex, err := parser.ParseExpr("", e)
+				if err != nil {
+					return nil, err
+				}
+
+				expr := value.Context().BuildExpr(ex, cue.Scope(value), cue.InferBuiltins(true))
+
+				data, err := cueEncodeYAML(expr)
+				if err != nil {
+					return nil, err
+				}
+
+				if shouldValidate && instance.Spec.Validate.Type == "cue" {
+					schema := value.LookupPath(cue.ParsePath(instance.Spec.Validate.Schema))
+					schema.Unify(expr)
+					if err := schema.Unify(expr).Validate(); err != nil {
+						msg := fmt.Sprintf("cue expression validation failed: %s", err)
+						switch instance.Spec.Validate.Mode {
+						case cuev1alpha1.FailPolicy:
+							r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
+							return nil, fmt.Errorf(msg)
+						case cuev1alpha1.DropPolicy:
+							r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
+							continue
+						case cuev1alpha1.AuditPolicy:
+							r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
+						case cuev1alpha1.IgnorePolicy:
+							log.Info(msg)
+						}
+					}
+				}
+
+				_, err = result.Write(data)
+				if err != nil {
+					return nil, err
+				}
+			}
+		} else {
+			data, err := cueEncodeYAML(value)
 			if err != nil {
 				return nil, err
 			}
 
+			valid := false
+
 			if shouldValidate && instance.Spec.Validate.Type == "cue" {
 				schema := value.LookupPath(cue.ParsePath(instance.Spec.Validate.Schema))
-				schema.Unify(expr)
-				if err := schema.Unify(expr).Validate(); err != nil {
-					msg := fmt.Sprintf("cue expression validation failed: %s", err)
+				if err := schema.Unify(value).Validate(); err != nil {
+					msg := fmt.Sprintf("cue validation failed: %s", err)
 					switch instance.Spec.Validate.Mode {
 					case cuev1alpha1.FailPolicy:
 						r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
 						return nil, fmt.Errorf(msg)
 					case cuev1alpha1.DropPolicy:
 						r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-						continue
+						valid = false
 					case cuev1alpha1.AuditPolicy:
 						r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-						break
 					case cuev1alpha1.IgnorePolicy:
 						log.Info(msg)
-						break
 					}
 				}
 			}
 
-			_, err = result.Write(data)
-			if err != nil {
-				return nil, err
-			}
-		}
-	} else {
-		data, err := cueEncodeYAML(value)
-		if err != nil {
-			return nil, err
-		}
-
-		valid := false
-
-		if shouldValidate && instance.Spec.Validate.Type == "cue" {
-			schema := value.LookupPath(cue.ParsePath(instance.Spec.Validate.Schema))
-			if err := schema.Unify(value).Validate(); err != nil {
-				msg := fmt.Sprintf("cue validation failed: %s", err)
-				switch instance.Spec.Validate.Mode {
-				case cuev1alpha1.FailPolicy:
-					r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-					return nil, fmt.Errorf(msg)
-				case cuev1alpha1.DropPolicy:
-					r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-					valid = false
-				case cuev1alpha1.AuditPolicy:
-					r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-				case cuev1alpha1.IgnorePolicy:
-					log.Info(msg)
+			if valid {
+				_, err = result.Write(data)
+				if err != nil {
+					return nil, err
 				}
 			}
 		}
 
-		if valid {
-			_, err = result.Write(data)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	for _, of := range inst.OrphanedFiles {
-		if of.Encoding == "yaml" {
-			data, err := yaml.Extract(of.Filename, nil)
-			if err != nil {
-				return nil, err
-			}
-			f := cctx.BuildFile(data)
+		for _, f := range orphans {
 			switch f.Kind() {
 			case cue.ListKind:
 				l, err := f.List()
@@ -655,7 +684,6 @@ func (r *CueInstanceReconciler) build(ctx context.Context,
 								continue
 							case cuev1alpha1.AuditPolicy:
 								r.event(ctx, *instance, revision, events.EventSeverityInfo, msg, nil)
-								break
 							case cuev1alpha1.IgnorePolicy:
 								log.Info(msg)
 							}
@@ -697,65 +725,28 @@ func (r *CueInstanceReconciler) build(ctx context.Context,
 }
 
 func (r *CueInstanceReconciler) checkGates(ctx context.Context,
-	revision, root, dir string,
+	revision string, values []cue.Value,
 	instance *cuev1alpha1.CueInstance,
 ) error {
 	log := ctrl.LoggerFrom(ctx)
-	cctx := cuecontext.New()
-
-	tags := make([]string, 0, len(instance.Spec.Tags))
-	for _, t := range instance.Spec.Tags {
-		if t.Value != "" {
-			tags = append(tags, fmt.Sprintf("%s=%s", t.Name, t.Value))
-		} else {
-			tags = append(tags, t.Name)
-		}
-	}
-
-	tagVars := load.DefaultTagVars()
-	for _, t := range instance.Spec.TagVars {
-		tagVars[t.Name] = load.TagVar{
-			Func: func() (ast.Expr, error) {
-				return ast.NewString(t.Value), nil
-			},
-		}
-	}
-
-	cfg := &load.Config{
-		ModuleRoot: root,
-		Dir:        dir,
-		DataFiles:  true, //TODO: this could be configurable
-		Tags:       tags,
-		TagVars:    tagVars,
-	}
-
-	if instance.Spec.Package != "" {
-		cfg.Package = instance.Spec.Package
-	}
-
-	ix := load.Instances([]string{}, cfg)
-	if len(ix) == 0 {
-		return fmt.Errorf("no instances found")
-	}
-
-	inst := ix[0]
-	if inst.Err != nil {
-		return inst.Err
-	}
-
-	value := cctx.BuildInstance(inst)
-	if value.Err() != nil {
-		return value.Err()
-	}
 
 	var errors []error
 	for _, g := range instance.Spec.Gates {
-		result := value.LookupPath(cue.ParsePath(g.Expr))
-		valid := result.Validate()
-		open, err := result.Bool()
-		if !open || valid != nil {
-			log.Info("gate check failed", "gate", g.Name, "expr", g.Expr, "result", result, "error", err)
-			errors = append(errors, fmt.Errorf("%s failed: %w", g.Name, err))
+		ex, err := parser.ParseExpr("", g.Expr)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("failed to parse gate expr: %w", err))
+			continue
+		}
+
+		for _, value := range values {
+			result := value.Context().BuildExpr(ex, cue.Scope(value), cue.InferBuiltins(true))
+
+			valid := result.Validate()
+			open, err := result.Bool()
+			if !open || valid != nil {
+				log.Info("gate check failed", "gate", g.Name, "expr", g.Expr, "result", result, "error", err)
+				errors = append(errors, fmt.Errorf("%s failed: %w", g.Name, err))
+			}
 		}
 	}
 
@@ -826,9 +817,9 @@ func (r *CueInstanceReconciler) apply(ctx context.Context, manager *ssa.Resource
 		if err != nil {
 			return false, nil, err
 		}
-		resultSet.Append(changeSet.Entries)
 
 		if changeSet != nil && len(changeSet.Entries) > 0 {
+			resultSet.Append(changeSet.Entries)
 			log.Info("server-side apply completed", "output", changeSet.ToMap())
 			for _, change := range changeSet.Entries {
 				if change.Action != string(ssa.UnchangedAction) {
@@ -852,9 +843,9 @@ func (r *CueInstanceReconciler) apply(ctx context.Context, manager *ssa.Resource
 		if err != nil {
 			return false, nil, fmt.Errorf("%w\n%s", err, changeSetLog.String())
 		}
-		resultSet.Append(changeSet.Entries)
 
 		if changeSet != nil && len(changeSet.Entries) > 0 {
+			resultSet.Append(changeSet.Entries)
 			log.Info("server-side apply completed", "output", changeSet.ToMap())
 			for _, change := range changeSet.Entries {
 				if change.Action != string(ssa.UnchangedAction) {
